@@ -1,0 +1,20 @@
+# Runtime output — generated every run, never commit
+movement_graphs/
+anomaly_reports/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environment
+.env
+*.env
+venv/
+.venv/
+
+# Editor
+.DS_Store
+*.swp
