@@ -40,6 +40,23 @@ INPUT_GLOB       = "*.json"           # matches any JSON file in movement_graphs
 OUTPUT_SNAPSHOT  = "insights_{ts}.json"
 OUTPUT_EVENTS    = "events.ndjson"
 
+import re as _re
+_TS_FROM_FILENAME = _re.compile(r"graph_(\d+)\.json$")
+
+def _extract_ts(path: Path, snapshot: dict) -> int:
+    """
+    Returns the logical snapshot timestamp in milliseconds.
+    Priority: (1) filename  graph_<ms>.json,
+              (2) 'snapshot_ts' field inside the JSON,
+              (3) file mtime (fallback).
+    """
+    m = _TS_FROM_FILENAME.search(path.name)
+    if m:
+        return int(m.group(1))
+    if "snapshot_ts" in snapshot:
+        return int(snapshot["snapshot_ts"])
+    return int(path.stat().st_mtime * 1000)
+
 
 # ---------------------------------------------------------------------------
 # Output writers
@@ -192,7 +209,7 @@ def run_watch(graph_dir: Path, out_dir: Path, interval: float):
         for path in new_files:
             try:
                 snapshot = json.loads(path.read_text(encoding="utf-8"))
-                snapshot_ts = int(path.stat().st_mtime * 1000)
+                snapshot_ts = _extract_ts(path, snapshot)
                 logger.info(f"Processing {path.name}")
                 process_snapshot(snapshot, state_manager, engine_state, out_dir, snapshot_ts)
             except Exception as e:

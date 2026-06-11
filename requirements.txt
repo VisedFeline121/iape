@@ -1,0 +1,5 @@
+# FloorFlow — Person 4 (Insight Engine)
+# Python 3.10+ required. Core engine uses stdlib only.
+
+# Optional — LLM narration (set OPENAI_API_KEY; or NARRATION_BACKEND=disabled for templates)
+openai>=1.0.0

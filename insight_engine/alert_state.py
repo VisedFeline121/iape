@@ -21,6 +21,9 @@ from typing import Optional
 
 SEVERITY_ORDER = ["detecting", "warning", "critical", "resolving", "resolved"]
 
+# Active-alert ladder — escalation/de-escalation moves one rung at a time
+ACTIVE_LADDER = ["detecting", "warning", "critical"]
+
 # Tunable thresholds — calibrate against real data during integration testing
 # These are starting points, not gospel
 SEVERITY_THRESHOLDS = {
@@ -152,19 +155,25 @@ class AlertStateManager:
                 active_this_cycle.get(alert_id, 0.0), urgency
             )
 
+        # Drop signals below the detecting threshold — never emit severity "none"
+        active_this_cycle = {
+            aid: urg for aid, urg in active_this_cycle.items()
+            if urg >= SEVERITY_THRESHOLDS["detecting"]
+        }
+
         # --- Process each alert that should be active this cycle ---
         for alert_id, urgency in active_this_cycle.items():
             zone_id, itype = alert_id.split("__", 1)
             target_sev = urgency_to_target_severity(urgency)
 
             if alert_id not in self.active_alerts:
-                # New alert
+                # New alerts always enter at DETECTING — escalation is earned over cycles
                 message = narrate_fn(itype, zone_id, signals, None)
                 alert = Alert(
                     id=alert_id,
                     zone_id=zone_id,
                     insight_type=itype,
-                    severity=target_sev,
+                    severity="detecting",
                     confidence=urgency,
                     message=message,
                     first_seen_ts=snapshot_ts,
@@ -223,6 +232,9 @@ class AlertStateManager:
             elif alert.severity != "resolving":
                 prev_severity  = alert.severity
                 alert.severity = "resolving"
+                alert.message  = narrate_fn(
+                    alert.insight_type, alert.zone_id, signals, alert
+                )
                 events.append(_event(
                     "de_escalated", alert, snapshot_ts, self.cycle,
                     from_severity=prev_severity, to_severity="resolving"
@@ -249,38 +261,53 @@ def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, v))
 
 
+def _ladder_index(severity: str) -> int:
+    return ACTIVE_LADDER.index(severity) if severity in ACTIVE_LADDER else -1
+
+
 def _apply_hysteresis(alert: Alert, urgency: float, target_sev: str) -> str:
     """
     Returns the new severity after applying hysteresis rules.
-    Escalation requires CYCLES_TO_ESCALATE consecutive cycles above threshold.
-    De-escalation requires CYCLES_TO_DEESCALATE consecutive cycles below threshold.
+
+    Escalation moves one rung at a time (detecting → warning → critical), never
+    skipping levels. Each step requires CYCLES_TO_ESCALATE consecutive cycles
+    where urgency supports at least the next rung.
+
+    De-escalation while still active also moves one rung at a time downward.
     A zone that previously hit a higher severity escalates faster on re-entry.
     """
-    current_idx = SEVERITY_ORDER.index(alert.severity)
-    target_idx  = SEVERITY_ORDER.index(target_sev) if target_sev in SEVERITY_ORDER else 0
+    current = alert.severity
+    if current not in ACTIVE_LADDER:
+        return current
+
+    current_idx = _ladder_index(current)
+    target_idx  = _ladder_index(target_sev) if target_sev in ACTIVE_LADDER else -1
 
     if target_idx > current_idx:
-        # Trying to escalate
         alert.escalation_streak   += 1
         alert.deescalation_streak  = 0
-        # Escalate faster if this zone has been here before
+
         needed = CYCLES_TO_ESCALATE
-        if alert.prior_max_severity in SEVERITY_ORDER:
-            prior_idx = SEVERITY_ORDER.index(alert.prior_max_severity)
-            if prior_idx >= target_idx:
+        next_idx = current_idx + 1
+        if alert.prior_max_severity in ACTIVE_LADDER:
+            prior_idx = _ladder_index(alert.prior_max_severity)
+            if prior_idx >= next_idx:
                 needed = max(1, CYCLES_TO_ESCALATE - 1)
+
         if alert.escalation_streak >= needed:
-            alert.prior_max_severity = max(
-                alert.severity, target_sev,
-                key=lambda s: SEVERITY_ORDER.index(s) if s in SEVERITY_ORDER else 0
-            )
-            return target_sev
+            next_sev = ACTIVE_LADDER[next_idx]
+            if _ladder_index(alert.prior_max_severity) < next_idx:
+                alert.prior_max_severity = next_sev
+            alert.escalation_streak = 0
+            return next_sev
+
     elif target_idx < current_idx:
-        # Trying to de-escalate
         alert.deescalation_streak += 1
         alert.escalation_streak    = 0
         if alert.deescalation_streak >= CYCLES_TO_DEESCALATE:
-            return target_sev
+            alert.deescalation_streak = 0
+            return ACTIVE_LADDER[current_idx - 1]
+
     else:
         alert.escalation_streak   = 0
         alert.deescalation_streak = 0

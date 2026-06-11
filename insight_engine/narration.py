@@ -126,6 +126,43 @@ def _call_llm(client, insight_type: str, zone_id: str, context: dict, alert) -> 
 
 
 # ---------------------------------------------------------------------------
+# Template helpers
+# ---------------------------------------------------------------------------
+
+def _time_phrase(windows: int, cycle_count: int, elapsed_s: int | None) -> str:
+    if elapsed_s and elapsed_s >= 60:
+        mins = elapsed_s // 60
+        return f"over the last {mins} minute{'s' if mins != 1 else ''}"
+    if elapsed_s and elapsed_s > 0:
+        return f"in the last {elapsed_s} seconds"
+    if windows > 1:
+        return f"over the last {windows} windows"
+    if cycle_count > 1:
+        return f"across the last {cycle_count} observations"
+    return "in the current observation"
+
+
+def _flow_description(inbound: int, outbound: int) -> str:
+    if inbound <= 0:
+        return "Movement in this sector has slowed"
+    if outbound <= 1 and inbound >= 4:
+        return f"{inbound} inbound movements with virtually no outflow detected"
+    if inbound > outbound * 2:
+        return f"{inbound} movements in against only {outbound} out — traffic is stacking up"
+    return f"{inbound} inbound and {outbound} outbound movements"
+
+
+def _growth_phrase(growth: float | None) -> str | None:
+    if growth is None or growth <= 1.05:
+        return None
+    if growth >= 3.0:
+        return "more than tripled"
+    if growth >= 2.0:
+        return "doubled"
+    return f"grown {growth:.1f}×"
+
+
+# ---------------------------------------------------------------------------
 # Template fallback — written to incident-commander standard
 # ---------------------------------------------------------------------------
 
@@ -135,71 +172,124 @@ def _template_message(
     context: dict,
     alert,
 ) -> str:
-    label    = _zone_label(zone_id)
-    severity = alert.severity if alert else "detecting"
-    acc      = context.get("accumulation_ratio", 0)
-    inbound  = context.get("inbound", 0)
-    dwell_s  = context.get("dwell_s", 0)
-    growth   = context.get("traffic_growth_x", None)
-    windows  = context.get("window_count", 0)
-    series   = context.get("trend_series", [])
-
-    time_ctx = f"across {windows} time windows" if windows > 1 else "in the current window"
+    label      = _zone_label(zone_id)
+    severity   = alert.severity if alert else "detecting"
+    inbound    = context.get("inbound", 0)
+    outbound   = context.get("outbound", 0)
+    dwell_s    = context.get("dwell_s", 0)
+    growth     = context.get("traffic_growth_x", None)
+    windows    = context.get("window_count", 0)
+    cycle_count = context.get("cycle_count", 1)
+    elapsed_s  = context.get("elapsed_seconds")
+    time_ctx   = _time_phrase(windows, cycle_count, elapsed_s)
+    flow       = _flow_description(inbound, outbound)
+    growth_txt = _growth_phrase(growth)
 
     if insight_type == "congestion_forecast":
-        if growth and growth > 1.1 and series:
+        if severity == "resolving":
+            drop = ""
+            if growth is not None and growth < 1.0:
+                pct = int((1 - growth) * 100)
+                if pct > 0:
+                    drop = f" Traffic dropped {pct}% {time_ctx}."
             return (
-                f"{label} traffic has grown {growth:.1f}× {time_ctx} and continues to rise. "
-                f"Current inbound rate is {inbound} transitions with an accumulation ratio of {acc:.1f}:1. "
-                f"{'Recommend diverting flow before this sector reaches capacity.' if severity in ('warning', 'critical') else ''}"
+                f"{label} returning to normal.{drop} "
+                f"Situation stabilizing — continue monitoring."
             ).strip()
+        if severity == "critical":
+            return (
+                f"{label} congestion confirmed {time_ctx}. "
+                f"{flow}. "
+                f"Immediate intervention required."
+            )
+        if severity == "warning":
+            lead = (
+                f"{label} traffic has {growth_txt} {time_ctx} and continues to rise."
+                if growth_txt
+                else f"{label} is developing a sustained traffic increase {time_ctx}."
+            )
+            return f"{lead} {flow}. Recommend diverting flow before this sector reaches capacity."
+        if growth_txt:
+            return (
+                f"{label} traffic has {growth_txt} {time_ctx}. "
+                f"{flow}. Pattern emerging — continue monitoring."
+            )
         return (
-            f"{label} is showing a consistent upward traffic trend {time_ctx}. "
-            f"Inbound rate: {inbound} transitions, accumulation ratio {acc:.1f}:1. "
-            f"{'Monitor closely — congestion is forecast if the trend continues.' if severity == 'warning' else 'Immediate intervention recommended.' if severity == 'critical' else ''}"
-        ).strip()
+            f"{label} is showing an upward traffic trend {time_ctx}. "
+            f"{flow}. Continue monitoring."
+        )
 
     if insight_type == "bottleneck_risk":
+        if severity == "resolving":
+            return (
+                f"{label} convergence pressure is easing {time_ctx}. "
+                f"Flow through this sector is improving."
+            )
+        if severity in ("warning", "critical"):
+            stay = f" Average stay is {dwell_s} seconds." if dwell_s else ""
+            action = (
+                "Immediate intervention required — sector may become impassable."
+                if severity == "critical"
+                else "Consider opening an alternative route."
+            )
+            return (
+                f"{label} is a convergence point {time_ctx} — multiple approach paths "
+                f"feeding into one sector.{stay} {flow}. {action}"
+            )
         return (
-            f"{label} is a convergence point absorbing {inbound} inbound transitions "
-            f"with an average stay of {dwell_s}s and accumulation ratio {acc:.1f}:1. "
-            f"{'This sector is at risk of becoming impassable — consider opening an alternative route.' if severity in ('warning', 'critical') else 'Situation developing — continue monitoring.'}"
+            f"{label} is absorbing increasing inbound traffic {time_ctx}. "
+            f"{flow}. Situation developing — continue monitoring."
         )
 
     if insight_type == "high_dwell_zone":
+        if severity == "resolving":
+            return (
+                f"{label} dwell times are normalizing {time_ctx}. "
+                f"Movement through this sector is resuming."
+            )
+        dwell_note = (
+            f"People are averaging {dwell_s} seconds here {time_ctx} — "
+            f"well above normal for this building."
+        )
+        if severity in ("warning", "critical"):
+            return (
+                f"{dwell_note} Possible obstruction, staging area, or point of friction. "
+                f"Recommend visual inspection of this sector."
+            )
         return (
-            f"{label} has an average dwell time of {dwell_s}s, significantly above normal {time_ctx}. "
-            f"People are spending extended time here — possible obstruction, waiting area, or point of friction. "
-            f"{'Recommend visual inspection of this sector.' if severity in ('warning', 'critical') else ''}"
-        ).strip()
+            f"{dwell_note} Possible waiting area or minor friction — continue monitoring."
+        )
 
     if insight_type == "unexpected_transition":
         from_label = _zone_label(context.get("from_zone", "unknown"))
-        prob       = context.get("transition_probability", 0)
         count      = context.get("transition_count", 0)
+        seen_for   = f"first seen {elapsed_s} seconds ago, " if elapsed_s else ""
+        uses       = f"used {count} time{'s' if count != 1 else ''}"
         return (
-            f"Atypical movement detected from {from_label} to {label}: "
-            f"{count} transitions observed at a base probability of {prob:.0%}. "
-            f"This route is not part of normal flow patterns — possible rerouting, restricted access, or evacuation behavior."
+            f"New route detected: {from_label} → {label}. "
+            f"This path has never been observed in this session — {seen_for}{uses}. "
+            f"Possible evacuation behavior or access to a previously unused area."
         )
 
     if insight_type == "anomaly":
         from_label = _zone_label(context.get("from_zone", ""))
         if from_label and from_label != _zone_label(""):
+            count = context.get("transition_count", 0)
+            uses = f", used {count} times so far" if count else ""
             return (
-                f"A new movement path from {from_label} to {label} has appeared — "
-                f"this route was not observed in any earlier period. "
+                f"New route detected: {from_label} → {label}. "
+                f"This path was not observed in any earlier period{uses}. "
                 f"Possible access to a previously unused area or a change in building conditions."
             )
         presence = context.get("presence_ratio", None)
         if presence is not None:
             return (
-                f"{label} was active in {presence:.0%} of observed windows but has gone quiet. "
-                f"Upstream feeders are still active. Possible blockage, access loss, or evacuation of this sector."
+                f"{label} has gone quiet {time_ctx} despite active upstream feeders. "
+                f"Possible blockage, access loss, or evacuation of this sector."
             )
         return (
-            f"{label} is displaying unusual activity patterns {time_ctx}. "
-            f"Deviation from session baseline detected. Recommend monitoring."
+            f"{label} is showing unusual activity {time_ctx}. "
+            f"Conditions have shifted — monitor closely for further development."
         )
 
     return f"{label} requires attention — unusual conditions detected {time_ctx}."
@@ -231,6 +321,11 @@ def _build_context(
     if len(series) >= 2 and series[0] > 0:
         growth = round(series[-1] / series[0], 2)
 
+    elapsed_seconds = None
+    snapshot_ts = signals.get("snapshot_ts")
+    if alert and snapshot_ts and alert.first_seen_ts:
+        elapsed_seconds = max(1, int((snapshot_ts - alert.first_seen_ts) / 1000))
+
     ctx = {
         "zone_id":            zone_id,
         "zone_label":         _zone_label(zone_id),
@@ -245,6 +340,7 @@ def _build_context(
         "trend_series":       series,
         "traffic_growth_x":   growth,
         "window_count":       len(series),
+        "elapsed_seconds":    elapsed_seconds,
         "ewma_deviation":     ewma_data.get("deviation_score", 0),
         "ewma_baseline":      ewma_data.get("ewma_baseline", 0),
         "cycle_count":        alert.cycle_count if alert else 1,

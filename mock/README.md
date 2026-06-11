@@ -1,34 +1,108 @@
-# Mock Data — Person 4 (Insight Engine)
+# Mock Data & Demo — Person 4 (Insight Engine)
 
-## Files
+Simulates Person 3's output so you can run and demo the insight engine without the full pipeline.
 
-| File | Description |
-|---|---|
-| `input_graph.json` | Sample output from Person 3 — feed this into `insight_engine.py` |
-| `output_insights.json` | Expected output from `insight_engine.py` — feed this to Person 5 |
+---
 
-## The Story in This Mock
+## Quick demo (two terminals)
 
-- **Zone 3** is a high-traffic waiting area (triage / reception analogue)
-  - Receives the most inbound transitions (32 total)
-  - Has the longest dwell time (14s average)
-  - Traffic into it is growing across all 3 time windows → congestion forecast
-- **Zone 4 → Zone 1** is a rare, unexpected path that only appeared in the last window → anomaly + unexpected transition
-
-## Usage
-
+**Terminal 1 — generate movement graph snapshots:**
 ```bash
-# Run the engine against this input
-python3 insight_engine.py --in mock/input_graph.json
-
-# Or write output to file
-python3 insight_engine.py --in mock/input_graph.json --out mock/output_insights.json
+cd mock
+python3 generate_mock_snapshots.py
 ```
 
-## For Person 5
+**Terminal 2 — run the insight engine:**
+```bash
+python3 insight_engine/engine.py \
+  --graph-dir mock/movement_graphs \
+  --out-dir mock/anomaly_reports
+```
 
-Your input is `output_insights.json`. Each object has:
-- `zone_id` — which zone to highlight
-- `insight_type` — one of: `bottleneck_risk`, `congestion_forecast`, `high_dwell_zone`, `anomaly`, `unexpected_transition`
-- `confidence` — 0.0 to 1.0, use for visual intensity (color, size, opacity)
-- `message` — human-readable string to display on screen
+Clear stale snapshots before a clean demo run:
+```bash
+rm -f mock/movement_graphs/*.json mock/anomaly_reports/insights_*.json mock/anomaly_reports/events.ndjson
+```
+
+---
+
+## What the mock scenario shows
+
+| Story | Alert | Arc |
+|---|---|---|
+| **A — Congestion** | `zone_3__congestion_forecast` | detecting → warning → critical → resolving → resolved |
+| **B — New route** | `zone_1__unexpected_transition` | Overlaps with Story A from step 3 (Sector 4 → Sector 1) |
+| Background | `zone_2__high_dwell_zone` | Persistent medical-staging area (high dwell) |
+
+Default run: **12 snapshots**, one every **3 seconds** (~36 s total).
+
+---
+
+## Generator options
+
+```bash
+python3 generate_mock_snapshots.py --steps 12 --interval 3   # demo (default)
+python3 generate_mock_snapshots.py --steps 100 --interval 3  # 5-minute soak test
+```
+
+Traffic tables loop after 12 steps for long runs.
+
+---
+
+## 5-minute soak test
+
+Runs generator + engine together for stability checking:
+
+```bash
+./mock/run_soak_test.sh
+```
+
+Or manually:
+```bash
+rm -f mock/movement_graphs/*.json mock/anomaly_reports/*
+NARRATION_BACKEND=disabled python3 insight_engine/engine.py \
+  --graph-dir mock/movement_graphs --out-dir mock/anomaly_reports --interval 1 &
+python3 mock/generate_mock_snapshots.py --steps 100 --interval 3
+```
+
+---
+
+## Output (for Person 5)
+
+The engine writes to `mock/anomaly_reports/` (or `../anomaly_reports/` in production):
+
+| File | Contents |
+|---|---|
+| `insights_<timestamp_ms>.json` | Per-cycle snapshot: `summary`, `alerts[]`, `cycle`, `elapsed_seconds` |
+| `events.ndjson` | Append-only event stream: `new`, `escalated`, `de_escalated`, `updated`, `resolved` |
+
+**Alert fields:** `id`, `zone_id`, `insight_type`, `severity`, `message`, `confidence`, `first_seen_ts`, `last_updated_ts`, `cycle_count`
+
+**Severity values:** `detecting`, `warning`, `critical`, `resolving`, `resolved`
+
+**Insight types:** `congestion_forecast`, `bottleneck_risk`, `high_dwell_zone`, `anomaly`, `unexpected_transition`
+
+---
+
+## One-shot test (single file)
+
+```bash
+python3 insight_engine/engine.py \
+  --once mock/movement_graphs/graph_<timestamp_ms>.json \
+  --out-dir mock/anomaly_reports
+```
+
+---
+
+## Environment
+
+```bash
+# Use template messages only (no API key needed — recommended for demo)
+export NARRATION_BACKEND=disabled
+
+# Optional LLM narration
+export OPENAI_API_KEY=sk-...
+export NARRATION_MODEL=gpt-4o-mini
+```
+
+Install optional deps: `pip install -r requirements.txt`

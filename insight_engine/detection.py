@@ -302,9 +302,9 @@ def compute_urgency(
     Combines all signals into a single urgency score [0, 1].
 
     Weights (tunable):
-      40% accumulation ratio (normalized against ratio of 5 as max)
-      35% trend score (slope * R²)
-      25% EWMA deviation from baseline
+      50% accumulation ratio — if people cannot leave, that IS the crisis
+      25% trend score (slope * R²) — worsening trajectory amplifies urgency
+      25% EWMA deviation — how far current load exceeds the running baseline
 
     Dwell time is used as a multiplier: a zone where people linger long
     under congestion is more urgent than one with fast throughput.
@@ -319,8 +319,8 @@ def compute_urgency(
     ewma_score  = _clamp(ewma.get("deviation_score", 0.0))
 
     base = (
-        0.40 * acc_score +
-        0.35 * trend_score +
+        0.50 * acc_score +
+        0.25 * trend_score +
         0.25 * ewma_score
     )
 

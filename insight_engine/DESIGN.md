@@ -1,10 +1,14 @@
 # Insight Engine — Design Document
 
+**Authoritative spec:** [`FINAL_VISION.md`](../FINAL_VISION.md) — this document describes how the code implements it. If they disagree, FINAL_VISION wins.
+
+---
+
 ## Purpose
 
-This component is Stage 4 of the FloorFlow pipeline. It receives a movement graph
-from Person 3 and produces a ranked list of operational insights: bottlenecks,
-anomalies, and congestion forecasts. Its output is consumed by Person 5's visualization.
+Stage 4 of FloorFlow. A **real-time situational awareness engine** that watches movement graph snapshots from Person 3, maintains live alert state, and writes operational insights for Person 5.
+
+It does not produce static reports. It tracks developing situations across cycles and speaks in the language of emergency operations.
 
 ---
 
@@ -13,132 +17,115 @@ anomalies, and congestion forecasts. Its output is consumed by Person 5's visual
 ```
 Person 3 (Movement Graph)
         │
-        │  graph summary JSON
+        │  movement_graphs/graph_<timestamp_ms>.json  (continuous)
         ▼
- insight_engine.py          ← you are here
+ insight_engine/              ← you are here
+   engine.py       — watch loop, I/O
+   detection.py    — signal extraction (stateless)
+   alert_state.py  — lifecycle, hysteresis, memory
+   narration.py    — message generation (LLM + templates)
         │
-        │  insights array JSON
+        │  anomaly_reports/insights_<ts>.json
+        │  anomaly_reports/events.ndjson
         ▼
 Person 5 (Visualization)
 ```
 
 ---
 
-## Core Design Principle: Urgency = Severity × Rate of Change
+## Module Responsibilities
 
-A zone that has always been slow is less actionable than a zone that is rapidly
-getting worse. The scoring model reflects this:
-
-```
-urgency = severity × (1 + trend_amplifier)
-```
-
-Where:
-- **severity** — how bad the zone currently is (blend of dwell, traffic, visits)
-- **trend_amplifier** — how fast it is getting worse (linear regression slope over windows)
-
-A stable-bad zone gets a moderate urgency score.
-A worsening zone gets the same severity score amplified by its growth rate.
-
----
-
-## Scoring Model
-
-### Severity (per zone)
-
-| Component | Weight | Source | What it measures |
-|---|---|---|---|
-| Dwell z-score | 35% | `zone_stats.avg_dwell_ms` | How long people stay vs. average |
-| Traffic z-score | 50% | Sum of `edge.transition_count` into zone | How much inbound flow vs. average |
-| Relative visits | 15% | `zone_stats.visit_count` | How frequently the zone is used |
-
-All components are normalized to [0, 1] before weighting.
-Z-scores are divided by 3 before clamping (treating ±3σ as the practical extremes).
-
-### Trend Slope
-
-Computed via least-squares linear regression over inbound traffic counts across
-all `time_windows`, in order. The raw slope is normalized by mean traffic to make
-it scale-free (so a slope of 2 means the same thing regardless of absolute volume).
-
-```
-trend_slope = linear_slope(inbound_per_window) / (mean_traffic + 1)
-             clamped to [-1.0, 1.0]
-```
-
-Only positive slopes amplify urgency. Zones with declining or flat traffic are
-not penalized — they may be resolved issues.
-
-### Urgency
-
-```
-urgency = clamp(severity × (1.0 + max(trend_slope, 0) × 1.5))
-```
-
-The `1.5` multiplier means a zone with maximum positive slope nearly doubles
-its urgency score. Tunable in `_score_zones()`.
-
----
-
-## Insight Type Selection
-
-One insight type is emitted per zone, chosen by priority:
-
-```
-1. congestion_forecast  — trend > 0.3 AND urgency > 0.5  (actively worsening)
-2. bottleneck_risk      — traffic_z > 0.6 AND urgency > 0.4  (heavy convergence)
-3. high_dwell_zone      — dwell_z > 0.6  (people stuck here)
-4. congestion_forecast  — trend > 0.2  (growing, even if not yet severe)
-5. anomaly              — fallback for anything else above the urgency threshold
-```
-
-This avoids emitting three overlapping alerts for the same zone about the same
-underlying problem.
-
----
-
-## Edge-Level Anomalies
-
-Handled in a separate pass (`_edge_anomalies`) after zone scoring, to avoid
-contaminating the zone urgency model with edge-specific signals.
-
-Two detections:
-
-1. **Unexpected transition** — a global edge with `transition_probability < 0.05`
-   that fired at least once. Confidence = `1 - (probability × 15)`.
-
-2. **Structural anomaly** — an edge that appears in the latest `time_window`
-   but was absent from all earlier windows. Fixed confidence of 0.70.
-
-Double-reporting is suppressed: if a zone already has an `unexpected_transition`
-insight from zone scoring, the edge pass skips it.
-
----
-
-## Output
-
-A JSON array sorted by `confidence` descending, deduplicated by `(zone_id, insight_type)`.
-
-```json
-[
-  {
-    "zone_id": "zone_3",
-    "insight_type": "congestion_forecast",
-    "message": "Zone 3 traffic has grown 2.8× over the last 15 minutes and is still rising — congestion is forecast if the trend continues.",
-    "confidence": 0.81
-  }
-]
-```
-
-### Allowed `insight_type` values
-
-| Value | Meaning |
+| Module | Role |
 |---|---|
-| `bottleneck_risk` | Zone is a high-traffic convergence point with long dwell |
-| `anomaly` | Unexpected structural or behavioral change |
-| `high_dwell_zone` | Zone has unusually long average dwell time |
-| `unexpected_transition` | A rare or new movement path was observed |
-| `congestion_forecast` | Zone traffic is trending upward — congestion predicted |
+| `engine.py` | Polls `movement_graphs/`, orchestrates each cycle, writes outputs atomically |
+| `detection.py` | Pure functions: accumulation, intra-trend, EWMA drift, structural change, cascade, convergence → per-zone urgency |
+| `alert_state.py` | Alert lifecycle (`detecting → warning → critical → resolving → resolved`), hysteresis, pattern memory |
+| `narration.py` | Turns signals into incident-commander messages; LLM primary, templates fallback |
+
+Detection is side-effect-free. All cross-snapshot memory lives in `engine.py` (EWMA baselines, edge history) and `alert_state.py` (active alerts).
+
+---
+
+## Detection Signals
+
+Each snapshot yields a signals dict consumed by the alert state manager.
+
+### Per-zone urgency (`detection.py` → `compute_urgency`)
+
+Combined score in `[0, 1]`:
+
+| Component | Weight | Source |
+|---|---|---|
+| Accumulation | 50% | Inbound vs outbound ratio — people arriving faster than leaving |
+| Intra-trend | 25% | Linear regression slope × R² over `time_windows` inbound series |
+| EWMA deviation | 25% | Current inbound vs running baseline across snapshots |
+
+Dwell time above median applies a multiplier (long stays under congestion = more urgent).
+
+### Cross-zone signals
+
+| Signal | Function | What it catches |
+|---|---|---|
+| Convergence | `compute_convergence` | Multiple high-traffic edges feeding one destination |
+| Cascade risk | `compute_cascade_risk` | Warning upstream + warning downstream on connected path |
+| Structural | `compute_structural_changes` | New edges, low-probability transitions, isolated zones |
+
+### Insight type selection (`alert_state.py` → `_select_insight_type`)
+
+One type per zone-level alert, by priority: `congestion_forecast` → `bottleneck_risk` → `high_dwell_zone` → `anomaly`.
+
+Structural alerts (`unexpected_transition`, new-route `anomaly`, isolation) are raised separately from edge/convergence passes.
+
+---
+
+## Alert Lifecycle
+
+Every alert moves through a severity ladder, not on/off:
+
+```
+detecting → warning → critical → resolving → resolved
+```
+
+Rules (`alert_state.py`):
+- **New alerts always start at `detecting`** — severity is earned over cycles, not assigned from raw urgency
+- **Escalation is one step at a time** — never jumps detecting → critical in one cycle
+- **Hysteresis** — `CYCLES_TO_ESCALATE` / `CYCLES_TO_DEESCALATE` consecutive cycles before step change
+- **Pattern memory** — zones that previously hit a severity escalate faster on re-entry
+- **Resolution** — absent signals for N cycles → `resolving` → `resolved`; explicit `resolved` event emitted
+
+Thresholds in `SEVERITY_THRESHOLDS` are tunable constants — calibrate against real Person 3 data during integration.
+
+---
+
+## Narration
+
+`narration.py` generates one message per alert create/escalation/de-escalation/resolving transition.
+
+- **Primary:** OpenAI-compatible API (configurable via env vars)
+- **Fallback:** Templates written to incident-commander standard — time context, magnitude, recommendations; no statistical jargon
+
+Set `NARRATION_BACKEND=disabled` to use templates only (recommended for demo reliability).
+
+---
+
+## Output Contract
+
+See FINAL_VISION for full schema. Summary:
+
+**Per cycle:** `anomaly_reports/insights_<timestamp_ms>.json`
+- `summary` — global situation headline (`zone_id: "global"`)
+- `alerts[]` — active alerts with `id`, `severity`, `message`, `confidence`, lifecycle timestamps
+
+**Append-only:** `anomaly_reports/events.ndjson`
+- Event types: `new`, `escalated`, `de_escalated`, `updated`, `resolved`
+
+---
+
+## Input Contract
+
+Person 3 writes `movement_graphs/graph_<timestamp_ms>.json`. Each file is a complete graph snapshot including cumulative `time_windows`.
+
+Engine reads `snapshot_ts` from filename first, then JSON field, then file mtime.
 
 ---
 
@@ -146,39 +133,59 @@ A JSON array sorted by `confidence` descending, deduplicated by `(zone_id, insig
 
 | Parameter | Location | Effect |
 |---|---|---|
-| `URGENCY_THRESHOLD` | module-level constant | Minimum urgency to emit an insight. Raise to reduce noise. |
-| Severity weights (0.35 / 0.50 / 0.15) | `_score_zones()` | Relative importance of dwell vs traffic vs visits |
-| Trend amplifier (1.5) | `_score_zones()` | How much a rising trend boosts urgency |
-| Insight type thresholds | `_select_insight_type()` | When each type is triggered |
-| Edge probability cutoff (0.05) | `_edge_anomalies()` | What counts as an "unexpected" transition |
+| `SEVERITY_THRESHOLDS` | `alert_state.py` | Urgency → detecting / warning / critical boundaries |
+| `CYCLES_TO_ESCALATE` / `CYCLES_TO_DEESCALATE` | `alert_state.py` | Hysteresis strength |
+| Urgency weights (50 / 25 / 25) | `detection.py` → `compute_urgency` | Accumulation vs trend vs EWMA |
+| `EWMA_ALPHA` | `detection.py` | Cross-snapshot baseline responsiveness |
+| Convergence / cascade cutoffs | `detection.py` | Cross-zone pattern sensitivity |
+| `NARRATION_*` env vars | `narration.py` | LLM backend and model |
 
 ---
 
-## Open Assumptions
+## Dependencies
 
-| # | Assumption | Impact if wrong | Resolution |
-|---|---|---|---|
-| 1 | `time_windows` do not include per-window `zone_stats` | Trend analysis uses edge counts instead of dwell trends — less precise | Extend `_per_window_inbound()` to return dwell series if Person 3 adds it |
-| 2 | Input is a single graph snapshot, not a stream | No statefulness needed | If Person 3 emits rolling updates, wrap `analyze()` in a polling loop |
+**Use whatever produces the best product.** No arbitrary stdlib-only restriction.
+
+Current stack:
+- **Core:** Python 3.10+ stdlib — sufficient for current detection math and I/O
+- **Optional:** `openai` — LLM narration (`requirements.txt`)
+
+Add libraries when they meaningfully improve quality or reliability:
+- `numpy` / `pandas` — richer time-series if snapshot history grows large
+- `scikit-learn` — isolation forest or other anomaly models if heuristics prove insufficient
+- `watchdog` — replace polling if filesystem latency becomes an issue
+
+Evaluate each on merit at integration time, not upfront.
 
 ---
 
 ## Usage
 
 ```bash
-# From stdin / stdout (pipe)
-python3 insight_engine.py < graph.json > insights.json
+# Demo (two terminals)
+cd mock && python3 generate_mock_snapshots.py
+python3 insight_engine/engine.py --graph-dir mock/movement_graphs --out-dir mock/anomaly_reports
 
-# From files
-python3 insight_engine.py --in graph.json --out insights.json
+# One-shot test
+python3 insight_engine/engine.py --once path/to/graph.json --out-dir anomaly_reports
 
-# As a Python module
-from insight_engine import analyze
-insights = analyze(graph_dict)
+# Production (Person 3's output folder)
+python3 insight_engine/engine.py --graph-dir ../movement_graphs --out-dir ../anomaly_reports
+
+# 5-minute soak test
+./mock/run_soak_test.sh
 ```
+
+See [`mock/README.md`](../mock/README.md) for full run instructions and Person 5 handoff details.
 
 ---
 
-## Dependencies
+## Integration Notes
 
-None beyond Python 3.10+ stdlib (`json`, `statistics`, `argparse`, `collections`).
+These are open questions for Person 3 integration, not design constraints:
+
+- Whether `time_windows` will include per-window `zone_stats` (would improve dwell-trend precision)
+- Real traffic levels for threshold calibration
+- Exact field names if their schema differs from mock
+
+Fix mismatches in `detection.py` input parsing when real snapshots arrive. Do not degrade the product to match a weaker input — coordinate schema with Person 3 instead.
